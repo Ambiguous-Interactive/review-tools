@@ -41,3 +41,7 @@ Main requires PRs and Self Test; tooling changes require owner review. Tags `v*`
 Release only a tested main commit. Publish an immutable version and pin callers to its SHA.
 Never move a published tag. Roll back a caller by reverting its migration PR.
 Keep fork tests secret-free. Review changes to workflows and code before sharing API secrets.
+
+Dependabot checks GitHub Actions and the Python development lockfile weekly on Mondays.
+Updates are grouped by ecosystem and pass the same required checks before merge.
+The standalone actionlint download and uv bootstrap version remain manual pins.
