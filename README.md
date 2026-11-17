@@ -21,7 +21,8 @@ Exclusions reduce accidental disclosure; they cannot detect every embedded secre
 
 Call `.github/workflows/agent-metrics.yml` at the same release SHA with `contents: read`,
 `issues: read`, and `pull-requests: read`. It needs no OpenAI secret. Inputs: `days` (90),
-`timeout-minutes` (15). It writes a summary and a 90-day JSON artifact.
+`timeout-minutes` (15). It writes a summary and requests 90-day JSON artifact retention. Organization and repository
+limits still apply; the current organization maximum is 30 days.
 Keep schedule and dispatch events in caller repositories.
 
 Metrics accept legacy run records. New records include cache reads and writes, coverage,
