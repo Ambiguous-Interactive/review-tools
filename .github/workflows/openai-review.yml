@@ -11,6 +11,14 @@ on:
       max-findings:
         type: number
         default: 5
+      max-diff-chars:
+        description: Maximum diff characters per model request
+        type: number
+        default: 180000
+      max-chunks:
+        description: Maximum model requests per review attempt
+        type: number
+        default: 8
       timeout-minutes:
         type: number
         default: 15
@@ -44,6 +52,10 @@ jobs:
         with:
           python-version: '3.13'
       - name: Review
+        id: review
+        # Advisory review failures must not turn into a merge gate.
+        continue-on-error: true
+        timeout-minutes: 12
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_TOKEN: ${{ github.token }}
@@ -51,11 +63,30 @@ jobs:
           OPENAI_REVIEW_MODEL: ${{ inputs.model }}
           OPENAI_REVIEW_EFFORT: ${{ inputs.effort }}
           MAX_FINDINGS: ${{ inputs.max-findings }}
+          MAX_DIFF_CHARS: ${{ inputs.max-diff-chars }}
+          MAX_CHUNKS: ${{ inputs.max-chunks }}
           REVIEW_DISCLOSURE: ${{ inputs.disclosure }}
           REVIEW_TOOLS_SHA: ${{ job.workflow_sha }}
-        run: python tools/openai_review.py --pr "$PR_NUMBER" --max-findings "$MAX_FINDINGS"
+        run: >-
+          python tools/openai_review.py --pr "$PR_NUMBER" --max-findings "$MAX_FINDINGS"
+          --max-diff-chars "$MAX_DIFF_CHARS" --max-chunks "$MAX_CHUNKS"
+          --output review-result.json
+      - name: Preserve review results
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.0
+        with:
+          name: openai-review-${{ github.run_id }}-${{ github.run_attempt }}
+          path: review-result.json
+          if-no-files-found: ignore
+          retention-days: 14
       - name: Outcome
         if: always()
         env:
-          OUTCOME: ${{ job.status }}
-        run: echo "Review execution status $OUTCOME. See step output for coverage and skip reasons." >> "$GITHUB_STEP_SUMMARY"
+          OUTCOME: ${{ steps.review.outcome }}
+        run: |
+          echo "Advisory review execution status $OUTCOME. See the review for coverage and omitted changes." >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != success ]; then
+            echo "::warning::Review incomplete. This advisory failure does not block merging and is not a clean review."
+          fi
