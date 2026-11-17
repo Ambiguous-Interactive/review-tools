@@ -45,6 +45,11 @@ Z_90 = 1.6449
 Fetch = Callable[[str], Any]
 
 
+def workflow_command(kind: str, message: str) -> str:
+    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    return f"::{kind}::{escaped}"
+
+
 def read_record(body: str | None, prefix: str) -> dict[str, Any] | None:
     text = body or ""
     start = text.rfind(prefix)
@@ -352,7 +357,7 @@ def main(arguments: Sequence[str]) -> int:
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     token = os.environ.get("GITHUB_TOKEN", "")
     if not repository or not token:
-        print("::error::GITHUB_REPOSITORY and GITHUB_TOKEN are required.", file=sys.stderr)
+        print(workflow_command("error", "GITHUB_REPOSITORY and GITHUB_TOKEN are required."), file=sys.stderr)
         return 1
     if parsed.days <= 0:
         parser.error("days must be positive")
