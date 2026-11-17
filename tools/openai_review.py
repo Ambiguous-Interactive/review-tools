@@ -23,15 +23,19 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 GITHUB_API = "https://api.github.com"
 OPENAI_API = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-6-luna"
 DEFAULT_MAX_FINDINGS = 5
 DEFAULT_MAX_DIFF_CHARS = 180000
+DEFAULT_MAX_CHUNKS = 8
+DEFAULT_MAX_REVIEW_SECONDS = 600
+MODEL_TIMEOUT_SECONDS = 300
 GUIDE_MAX_CHARS = 24000
 MARKER_PREFIX = "<!-- openai-review:"
+PARTIAL_MARKER_PREFIX = "<!-- openai-review-partial:"
 RECORD_PREFIX = "<!-- openai-review-run: "
 RECORD_SUFFIX = " -->"
 DISCLOSURE = os.environ.get("REVIEW_DISCLOSURE", "DISCLOSURE: LLM-GENERATED TEXT")
@@ -43,6 +47,7 @@ SKIPPED_PATTERNS = (
 )
 GUIDE_CANDIDATES = ("REVIEW.md", ".github/REVIEW.md", "AGENTS.md", ".llm/context.md", "CLAUDE.md")
 HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+FULL_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*)")
 SEVERITIES = ("critical", "major", "minor")
 
 FINDINGS_SCHEMA: dict[str, Any] = {
@@ -85,7 +90,7 @@ def http_json(method: str, url: str, headers: Mapping[str, str], body: Any = Non
     request = urllib.request.Request(url, data=data, method=method, headers=dict(headers))
     if data is not None:
         request.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(request, timeout=300) as response:
+    with urllib.request.urlopen(request, timeout=MODEL_TIMEOUT_SECONDS if url == OPENAI_API else 30) as response:
         payload = response.read().decode("utf-8")
     return payload if raw else (json.loads(payload) if payload else None)
 
@@ -183,12 +188,58 @@ def is_skipped(path: str) -> bool:
     return any(fnmatch.fnmatch(name, pattern) or fnmatch.fnmatch(path, pattern) for pattern in SKIPPED_PATTERNS)
 
 
+def skipped_block(path: str, text: str) -> bool:
+    if is_skipped(path):
+        return True
+    for line in text.splitlines():
+        if line.startswith("@@ "):
+            break
+        if line.startswith(("--- ", "+++ ")) and is_skipped(side_path(line[4:])):
+            return True
+    return False
+
+
+def quoted_path(path: str) -> str:
+    return '"' + ''.join(chr(byte) if 32 <= byte < 127 and byte not in (34, 92)
+                         else f"\\{byte:03o}" for byte in path.encode("utf-8")) + '"'
+
+
+def file_patch_diff(base: str, token: str, deadline: float) -> tuple[str, list[str]]:
+    """Best-effort fallback. GitHub caps this API at 3,000 files; never claim full coverage."""
+    blocks: list[str] = []
+    missing: list[str] = []
+    for page in range(1, 31):
+        if time.monotonic() + 30 > deadline:
+            break
+        try:
+            entries = http_json("GET", f"{base}/files?per_page=100&page={page}", github_headers(token))
+        except (urllib.error.URLError, TimeoutError):
+            print("::warning::File patch pagination interrupted; retaining patches already fetched.")
+            break
+        for entry in entries:
+            path = entry["filename"]
+            old_path = entry.get("previous_filename", path)
+            if is_skipped(path) or is_skipped(old_path):
+                continue
+            patch = entry.get("patch")
+            if not isinstance(patch, str) or not patch.strip():
+                missing.append(path)
+                continue
+            old = "/dev/null" if entry.get("status") == "added" else quoted_path("a/" + old_path)
+            new = "/dev/null" if entry.get("status") == "removed" else quoted_path("b/" + path)
+            blocks.append(f"diff --git {quoted_path('a/' + old_path)} {quoted_path('b/' + path)}\n"
+                          f"--- {old}\n+++ {new}\n{patch.rstrip()}\n")
+        if len(entries) < 100:
+            break
+    return "".join(blocks), missing
+
+
 def trim_diff(diff: str, max_chars: int) -> tuple[str, list[str]]:
     kept: list[str] = []
     dropped: list[str] = []
     used = 0
     for path, text in split_diff(diff):
-        if is_skipped(path):
+        if skipped_block(path, text):
             dropped.append(path)
             continue
         if used + len(text) > max_chars:
@@ -197,6 +248,119 @@ def trim_diff(diff: str, max_chars: int) -> tuple[str, list[str]]:
         kept.append(text)
         used += len(text)
     return "".join(kept), dropped
+
+
+def file_priority(item: tuple[str, str]) -> tuple[int, str]:
+    """Spend limited review capacity on security/configuration/code before tests and docs."""
+    path = item[0].lower()
+    if any(word in path for word in ("security", "auth", "permission", "crypto")):
+        rank = 0
+    elif path.startswith(".github/") or path.endswith((".toml", ".yml", ".yaml", "package.json")):
+        rank = 1
+    elif "test" in path.split("/") or path.startswith("tests/") or "test_" in path or "_test." in path:
+        rank = 3
+    elif path.endswith((".md", ".rst", ".txt")) or path.startswith("docs/"):
+        rank = 4
+    else:
+        rank = 2
+    return rank, path
+
+
+def file_parts(text: str, max_chars: int) -> Iterator[str]:
+    """Split large hunks with correct old/new offsets; never cut a source line in half."""
+    if len(text) <= max_chars:
+        yield text
+        return
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, line in enumerate(lines) if FULL_HUNK_HEADER.match(line)]
+    if not starts:
+        return
+    prefix = "".join(lines[:starts[0]])
+    starts.append(len(lines))
+    for start, end in zip(starts, starts[1:]):
+        match = FULL_HUNK_HEADER.match(lines[start])
+        assert match is not None
+        old, new = int(match.group(1)), int(match.group(2))
+        suffix = match.group(3)
+        old_start, new_start = old, new
+        body: list[str] = []
+        body_chars = old_count = new_count = 0
+
+        def header(left: int, right: int, left_count: int, right_count: int) -> str:
+            return prefix + f"@@ -{left},{left_count} +{right},{right_count} @@{suffix}\n"
+
+        units: list[str] = []
+        for line in lines[start + 1:end]:
+            if line.startswith("\\ No newline") and units:
+                units[-1] += line
+            else:
+                units.append(line)
+        for line in units:
+            left = int(line.startswith((" ", "-")))
+            right = int(line.startswith((" ", "+")))
+            if (len(header(old_start, new_start, old_count + left, new_count + right))
+                    + body_chars + len(line) > max_chars):
+                if body:
+                    yield header(old_start, new_start, old_count, new_count) + "".join(body)
+                    body = []
+                    body_chars = old_count = new_count = 0
+                old_start, new_start = old, new
+                if len(header(old_start, new_start, left, right)) + len(line) > max_chars:
+                    # Signal an uncovered line without discarding subsequent reviewable lines.
+                    yield ""
+                    old += left
+                    new += right
+                    old_start, new_start = old, new
+                    continue
+            body.append(line)
+            body_chars += len(line)
+            old_count += left
+            new_count += right
+            old += left
+            new += right
+        if body and (old_count or new_count):
+            yield header(old_start, new_start, old_count, new_count) + "".join(body)
+
+
+def plan_review(diff: str, max_chars: int, max_chunks: int) -> tuple[list[str], list[str], list[str]]:
+    chunks: list[str] = []
+    excluded: list[str] = []
+    omitted: set[str] = set()
+    for path, text in sorted(split_diff(diff), key=file_priority):
+        if skipped_block(path, text):
+            excluded.append(path)
+            continue
+        saw_part = False
+        for part in file_parts(text, max_chars):
+            saw_part = True
+            if not part:
+                omitted.add(path)
+            elif chunks and len(chunks[-1]) + len(part) <= max_chars:
+                chunks[-1] += part
+            elif len(chunks) < max_chunks:
+                chunks.append(part)
+            else:
+                omitted.add(path)
+                break
+        if not saw_part:
+            omitted.add(path)
+    return chunks, excluded, sorted(omitted)
+
+
+def sum_usage(usages: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Sum reported accounting, preserving unknown fields instead of inventing zeroes."""
+    if len(usages) == 1:
+        return dict(usages[0])
+    result: dict[str, Any] = {}
+    for key in {key for usage in usages for key in usage}:
+        values = [usage.get(key) for usage in usages]
+        if all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values):
+            result[key] = sum(values)
+        elif all(isinstance(value, Mapping) for value in values):
+            result[key] = sum_usage([value for value in values if isinstance(value, Mapping)])
+        else:
+            result[key] = None
+    return result
 
 
 def commentable_lines(diff: str) -> dict[str, set[int]]:
@@ -309,7 +473,7 @@ def review_record(model: str, effort: str, usage: Mapping[str, Any], findings: i
     record = {
         "v": 2,
         "workflow_sha": os.environ.get("REVIEW_TOOLS_SHA", ""),
-        "coverage": "full-eligible-diff",
+        "coverage": usage.get("coverage", "full-eligible-diff"),
         "duration_seconds": usage.get("duration_seconds"),
         "cache_write_tokens": input_details.get("cache_write_tokens") if isinstance(input_details, Mapping) else None,
         "cache_write_tokens_details": input_details.get("cache_write_tokens_details") if isinstance(input_details, Mapping) else None,
@@ -325,6 +489,10 @@ def review_record(model: str, effort: str, usage: Mapping[str, Any], findings: i
         "cached_tokens": input_details.get("cached_tokens") if isinstance(input_details, Mapping) else None,
         "unchanged_files": unchanged,
     }
+    for key in ("chunks_planned", "chunks_attempted", "chunks_reviewed", "failed_chunks", "unreviewed_chunks",
+                "omitted_files", "usage_complete"):
+        if key in usage:
+            record[key] = usage[key]
     text = json.dumps(record, separators=(",", ":")).replace(">", "\\u003e")
     return f"{RECORD_PREFIX}{text}{RECORD_SUFFIX}"
 
@@ -358,15 +526,20 @@ def build_review(result: Mapping[str, Any], lines: Mapping[str, set[int]], head_
     count = len(comments) + len(loose)
     tokens = f"{usage.get('input_tokens', '?')} in, {usage.get('output_tokens', '?')} out"
     body_parts = [DISCLOSURE] if DISCLOSURE else []
-    body_parts += [f"OpenAI review: {count} finding{'s' if count != 1 else ''}.",
+    partial = usage.get("coverage", "full-eligible-diff") != "full-eligible-diff"
+    label = "Partial OpenAI review" if partial else "OpenAI review"
+    body_parts += [f"{label}: {count} finding{'s' if count != 1 else ''}.",
                    str(result.get("summary", "")).strip()]
+    if usage.get("coverage_note"):
+        body_parts.append(str(usage["coverage_note"]))
     if loose:
         body_parts += ["Findings outside the changed lines:", "\n".join(loose)]
     body_parts.append(f"<sub>{tokens} tokens. Comments only; this review never blocks a merge.</sub>")
     body_parts.append(review_record(model, effort, usage, count, len(comments), diff_chars, dropped, unchanged))
     body_parts = [part.replace("<!--", "&lt;!--") for part in body_parts]
     body_parts[-1] = review_record(model, effort, usage, count, len(comments), diff_chars, dropped, unchanged)
-    body_parts.append(f"{MARKER_PREFIX}{head_sha} -->")
+    marker = PARTIAL_MARKER_PREFIX if partial else MARKER_PREFIX
+    body_parts.append(f"{marker}{head_sha} -->")
     return {"commit_id": head_sha, "event": "COMMENT", "body": "\n\n".join(body_parts), "comments": comments}
 
 
@@ -406,7 +579,8 @@ def body_only(review: Mapping[str, Any], model: str, effort: str, usage: Mapping
     record = review_record(model, effort, usage, findings, 0, diff_chars, dropped, unchanged)
     if 0 <= start and len(RECORD_SUFFIX) <= end:
         body = body[:start] + record + body[end:]
-    body = body.replace(MARKER_PREFIX, inline + "\n\n" + MARKER_PREFIX, 1)
+    marker = PARTIAL_MARKER_PREFIX if usage.get("coverage", "full-eligible-diff") != "full-eligible-diff" else MARKER_PREFIX
+    body = body.replace(marker, inline + "\n\n" + marker, 1)
     return {**review, "comments": [], "body": body}
 
 
@@ -426,8 +600,11 @@ def main(argv: Sequence[str]) -> int:
                         help="reasoning effort (for example low, medium, high); blank keeps the model default")
     parser.add_argument("--max-findings", type=positive_int, default=DEFAULT_MAX_FINDINGS)
     parser.add_argument("--max-diff-chars", type=positive_int, default=DEFAULT_MAX_DIFF_CHARS)
+    parser.add_argument("--max-chunks", type=positive_int, default=DEFAULT_MAX_CHUNKS)
+    parser.add_argument("--max-review-seconds", type=positive_int, default=DEFAULT_MAX_REVIEW_SECONDS)
     parser.add_argument("--root", type=pathlib.Path, default=pathlib.Path.cwd())
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--output", type=pathlib.Path, help="save the review before attempting GitHub publication")
     arguments = parser.parse_args(argv)
     repository = os.environ.get("GITHUB_REPOSITORY", "")
     github_token = os.environ.get("GITHUB_TOKEN", "")
@@ -460,59 +637,118 @@ def main(argv: Sequence[str]) -> int:
             return 0
         base_sha = pull["base"]["sha"]
         compare = f"{GITHUB_API}/repos/{repository}/compare/{base_sha}...{head_sha}"
-        diff = http_json("GET", compare, github_headers(github_token, "application/vnd.github.diff"), raw=True)
+        fallback = False
+        missing_patches: list[str] = []
+        try:
+            diff = http_json("GET", compare, github_headers(github_token, "application/vnd.github.diff"), raw=True)
+        except (urllib.error.URLError, TimeoutError):
+            print("::warning::Combined diff unavailable; reviewing available file patches instead.")
+            diff, missing_patches = file_patch_diff(base, github_token, started + arguments.max_review_seconds)
+            fallback = True
         latest = http_json("GET", base, github_headers(github_token))
-        if latest["head"]["sha"] != head_sha:
+        if latest["head"]["sha"] != head_sha or latest["base"]["sha"] != base_sha:
             print(f"The pull request moved past {head_sha[:10]}; the run for the new commit reviews it.")
             return 0
     except (urllib.error.URLError, TimeoutError, KeyError) as error:
         print(f"::error::GitHub diff unavailable ({type(error).__name__}).")
         return 1
-    trimmed, dropped = trim_diff(diff, arguments.max_diff_chars)
-    eligible_size = sum(len(text) for path, text in split_diff(diff) if not is_skipped(path))
-    if eligible_size > arguments.max_diff_chars:
-        print("::error::Eligible diff exceeds the review budget; no completion marker posted.")
-        return 1
-    if not trimmed.strip():
+    chunks, dropped, omitted = plan_review(diff, arguments.max_diff_chars, arguments.max_chunks)
+    omitted = sorted(set(omitted + missing_patches))
+    if not chunks and not omitted and not fallback:
         print("No eligible changes.")
         return 0
     guide_parts = []
-    for candidate in GUIDE_CANDIDATES:
+    guide_failures = 0
+    for guide_index, candidate in enumerate(GUIDE_CANDIDATES):
         url = f"{GITHUB_API}/repos/{repository}/contents/{candidate}?ref={base_sha}"
+        if time.monotonic() + 30 > started + arguments.max_review_seconds:
+            guide_failures += len(GUIDE_CANDIDATES) - guide_index
+            break
         try:
             entry = http_json("GET", url, github_headers(github_token))
             if entry.get("type") == "file" and entry.get("encoding") == "base64":
                 content = base64.b64decode(entry["content"]).decode("utf-8", errors="replace")
                 guide_parts.append(f"Repository guide ({candidate}):\n{content}")
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
-                raise
+        except (urllib.error.URLError, TimeoutError) as error:
+            if not isinstance(error, urllib.error.HTTPError) or error.code != 404:
+                guide_failures += 1
+                print("::warning::A repository guide was unavailable; continuing with available guides.")
     guide = "\n\n".join(guide_parts)[:GUIDE_MAX_CHARS]
-    request = build_request(arguments.model, arguments.max_findings, guide, pull, trimmed, dropped,
-                            arguments.effort, (), f"openai-review:{repository}")
-    request["store"] = False
-    request["max_output_tokens"] = 8000
-    try:
-        response = http_json("POST", OPENAI_API, {"Authorization": f"Bearer {openai_key}"}, request)
-    except urllib.error.HTTPError as error:
-        print(f"::error::OpenAI API returned HTTP {error.code}.")
-        return 1
-    except (urllib.error.URLError, TimeoutError) as error:
-        print(f"::error::OpenAI request failed ({type(error).__name__}).")
-        return 1
-    result = usable_answer(response)
-    if result is None:
-        print(f"Skipped: the model gave no usable review (status {response.get('status')}). No marker posted.")
-        return 1
-    response.setdefault("usage", {})["duration_seconds"] = round(time.monotonic() - started, 3)
-    review = build_review(result, commentable_lines(trimmed), head_sha, arguments.model,
-                          arguments.max_findings, response.get("usage") or {}, arguments.effort, len(trimmed),
+    results: list[dict[str, Any]] = []
+    usages: list[Mapping[str, Any]] = []
+    successful_chunks: list[str] = []
+    attempted_chunks = 0
+    for index, chunk in enumerate(chunks, 1):
+        if time.monotonic() + MODEL_TIMEOUT_SECONDS > started + arguments.max_review_seconds:
+            print("::warning::Review time budget reached; retaining completed parts.")
+            break
+        request = build_request(arguments.model, arguments.max_findings, guide, pull, chunk, [*dropped, *omitted],
+                                arguments.effort, (), f"openai-review:{repository}")
+        if len(chunks) > 1 or omitted:
+            request["instructions"] += (f"\nThis is part {index} of {len(chunks)} of a bounded review. "
+                                        "Only assess the supplied diff; do not claim the entire PR is correct.")
+        request["store"] = False
+        request["max_output_tokens"] = 8000
+        attempted_chunks += 1
+        try:
+            response = http_json("POST", OPENAI_API, {"Authorization": f"Bearer {openai_key}"}, request)
+        except (urllib.error.URLError, TimeoutError) as error:
+            print(f"::warning::Review part {index} unavailable ({type(error).__name__}); continuing other parts.")
+            continue
+        usages.append(response.get("usage") or {})
+        answer = usable_answer(response)
+        if answer is None:
+            print(f"::warning::Review part {index} produced no usable result; continuing other parts.")
+            continue
+        results.append(answer)
+        successful_chunks.append(chunk)
+    usage = sum_usage(usages)
+    usage["duration_seconds"] = round(time.monotonic() - started, 3)
+    failed_chunks = attempted_chunks - len(results)
+    unreviewed_chunks = len(chunks) - len(results)
+    partial = bool(omitted or unreviewed_chunks or fallback or guide_failures)
+    usage["usage_complete"] = bool(usages) and failed_chunks == 0 and all(
+        isinstance(item.get(key), (int, float)) for item in usages for key in ("input_tokens", "output_tokens"))
+    if len(chunks) > 1 or partial:
+        usage.update(chunks_planned=len(chunks), chunks_attempted=attempted_chunks, chunks_reviewed=len(results),
+                     failed_chunks=failed_chunks, unreviewed_chunks=unreviewed_chunks, omitted_files=len(omitted))
+    if partial:
+        usage["coverage"] = "partial" if results else "not-reviewed"
+        usage["coverage_note"] = (f"Partial coverage: {len(results)} of {len(chunks)} planned parts reviewed; "
+                                  f"{len(omitted)} eligible files have known omitted content. "
+                                  "Security, configuration and source files were prioritized. "
+                                  "Unreviewed changes are not a clean review; reruns may retry incomplete coverage.")
+        if fallback:
+            usage["coverage_note"] += " GitHub file patches were used; they may be truncated or limited to 3,000 files."
+        if guide_failures:
+            usage["coverage_note"] += f" {guide_failures} repository guides were unavailable."
+        print(f"::warning::{usage['coverage_note']}")
+        reviewed_paths = sorted({path for chunk in successful_chunks for path, _ in split_diff(chunk)})
+        for label, paths in (("Files with reviewed content", reviewed_paths), ("Files with omitted content", omitted)):
+            if paths:
+                names = [json.dumps(path, ensure_ascii=True).replace('`', '\\u0060').replace('<', '\\u003c')
+                         for path in paths[:20]]
+                usage["coverage_note"] += f"\n\n{label}: " + ", ".join(f"`{name}`" for name in names)
+                if len(paths) > 20:
+                    usage["coverage_note"] += f" (and {len(paths) - 20} more)"
+    findings = [finding for answer in results for finding in answer["findings"]]
+    unique: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for finding in sorted(findings, key=lambda item: SEVERITIES.index(item["severity"])):
+        unique.setdefault((finding["path"], finding["line"], finding["title"]), finding)
+    result = {"summary": results[0]["summary"] if len(results) == 1 and not partial else
+              f"Reviewed {len(results)} bounded diff parts. Cross-part interactions may need human review.",
+              "findings": list(unique.values())}
+    reviewed_diff = "".join(successful_chunks)
+    review = build_review(result, commentable_lines(reviewed_diff), head_sha, arguments.model,
+                          arguments.max_findings, usage, arguments.effort, len(reviewed_diff),
                           len(dropped), 0)
+    if arguments.output is not None:
+        arguments.output.write_text(json.dumps(review, indent=2) + "\n", encoding="utf-8")
     if arguments.dry_run:
         print(json.dumps(review, indent=2))
         return 0
     latest = http_json("GET", base, github_headers(github_token))
-    if latest["head"]["sha"] != head_sha:
+    if latest["head"]["sha"] != head_sha or latest["base"]["sha"] != base_sha:
         print("Superseded head; no review posted.")
         return 0
     current = http_json("GET", f"{base}/reviews?per_page=100", github_headers(github_token))
@@ -524,9 +760,9 @@ def main(argv: Sequence[str]) -> int:
         if error.code != 422 or not review["comments"]:
             raise
         print(f"Inline review refused ({error.code}); posting the findings in the review body.", file=sys.stderr)
-        findings = len(result.get("findings") or [])
-        review = body_only(review, arguments.model, arguments.effort, response.get("usage") or {}, findings,
-                           len(trimmed), len(dropped), 0)
+        finding_count = min(arguments.max_findings, len(result.get("findings") or []))
+        review = body_only(review, arguments.model, arguments.effort, usage, finding_count,
+                           len(reviewed_diff), len(dropped), 0)
         http_json("POST", f"{base}/reviews", github_headers(github_token), review)
     print(f"Posted a review with {len(review['comments'])} inline comments on {head_sha[:10]}.")
     return 0

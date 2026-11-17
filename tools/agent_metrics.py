@@ -185,6 +185,8 @@ def review_rows(
 
 
 def token_cost(row: Mapping[str, Any], prices: Mapping[str, Mapping[str, float]]) -> float | None:
+    if row.get("usage_complete") is False:
+        return None
     price = prices.get(str(row.get("model")))
     if not price:
         return None

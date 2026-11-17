@@ -51,10 +51,13 @@ def setup_review(monkeypatch, diff, response=None):
 DIFF = 'diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-old\n+new\n'
 
 
-def test_over_budget_never_calls_model_or_posts_marker(monkeypatch):
+def test_unreviewable_budget_posts_explicit_notice_without_completion_marker(monkeypatch):
     calls = setup_review(monkeypatch, DIFF)
-    assert review.main(['--pr', '1', '--max-diff-chars', '1']) == 1
-    assert all(method != 'POST' for method, _, _ in calls)
+    assert review.main(['--pr', '1', '--max-diff-chars', '1']) == 0
+    assert all(url != review.OPENAI_API for _, url, _ in calls)
+    posted = next(body for method, url, body in calls if method == 'POST' and url.endswith('/reviews'))
+    assert review.read_review_record(posted['body'])['coverage'] == 'not-reviewed'
+    assert review.MARKER_PREFIX not in posted['body']
 
 
 def test_full_review_posts_one_comment(monkeypatch):
@@ -66,7 +69,9 @@ def test_full_review_posts_one_comment(monkeypatch):
     assert DIFF in request['input'] and request['store'] is False
 
 
-def test_unusable_response_fails_without_marker(monkeypatch):
+def test_unusable_response_posts_incomplete_notice_without_completion_marker(monkeypatch):
     calls = setup_review(monkeypatch, DIFF, {'status': 'incomplete'})
-    assert review.main(['--pr', '1']) == 1
-    assert not any(method == 'POST' and url.endswith('/reviews') for method, url, _ in calls)
+    assert review.main(['--pr', '1']) == 0
+    posted = next(body for method, url, body in calls if method == 'POST' and url.endswith('/reviews'))
+    assert review.read_review_record(posted['body'])['coverage'] == 'not-reviewed'
+    assert review.MARKER_PREFIX not in posted['body']
