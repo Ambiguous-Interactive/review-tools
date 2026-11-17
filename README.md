@@ -21,7 +21,8 @@ Exclusions reduce accidental disclosure; they cannot detect every embedded secre
 
 Call `.github/workflows/agent-metrics.yml` at the same release SHA with `contents: read`,
 `issues: read`, and `pull-requests: read`. It needs no OpenAI secret. Inputs: `days` (90),
-`timeout-minutes` (15). It writes a summary and a 90-day JSON artifact.
+`timeout-minutes` (15). It writes a summary and requests 90-day JSON artifact retention. Organization and repository
+limits still apply; the current organization maximum is 30 days.
 Keep schedule and dispatch events in caller repositories.
 
 Metrics accept legacy run records. New records include cache reads and writes, coverage,
@@ -37,7 +38,11 @@ Run `uv sync --frozen`, `uv run pytest -q`, `uv run mypy --strict tools`,
 
 ## Releases
 
-Main requires PRs and Self Test; tooling changes require owner review. Tags `v*` are protected.
+Main requires PRs and Self Test; approvals are optional. Tags `v*` are protected.
 Release only a tested main commit. Publish an immutable version and pin callers to its SHA.
 Never move a published tag. Roll back a caller by reverting its migration PR.
 Keep fork tests secret-free. Review changes to workflows and code before sharing API secrets.
+
+Dependabot checks GitHub Actions and the Python development lockfile weekly on Mondays.
+Updates are grouped by ecosystem and pass the same required checks before merge.
+The standalone actionlint download and uv bootstrap version remain manual pins.
