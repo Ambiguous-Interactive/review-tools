@@ -38,7 +38,7 @@ Run `uv sync --frozen`, `uv run pytest -q`, `uv run mypy --strict tools`,
 
 ## Releases
 
-Main requires PRs and Self Test; tooling changes require owner review. Tags `v*` are protected.
+Main requires PRs and Self Test; approvals are optional. Tags `v*` are protected.
 Release only a tested main commit. Publish an immutable version and pin callers to its SHA.
 Never move a published tag. Roll back a caller by reverting its migration PR.
 Keep fork tests secret-free. Review changes to workflows and code before sharing API secrets.
