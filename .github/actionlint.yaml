@@ -1,0 +1,9 @@
+# GitHub.com supports these fields; actionlint 1.7.12 has an older context schema.
+# https://docs.github.com/en/actions/reference/workflows-and-actions/contexts
+paths:
+  .github/workflows/openai-review.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type'
+  .github/workflows/agent-metrics.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type'

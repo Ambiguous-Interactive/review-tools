@@ -1,0 +1,10 @@
+[project]
+name = "ambiguous-review-tools"
+version = "1.0.0"
+requires-python = ">=3.13"
+[dependency-groups]
+dev = ["pytest", "mypy", "yamllint"]
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+[tool.mypy]
+strict = true

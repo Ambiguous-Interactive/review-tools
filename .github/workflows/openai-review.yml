@@ -1,0 +1,61 @@
+name: OpenAI Review
+on:
+  workflow_call:
+    inputs:
+      model:
+        type: string
+        default: ''
+      effort:
+        type: string
+        default: ''
+      max-findings:
+        type: number
+        default: 5
+      timeout-minutes:
+        type: number
+        default: 15
+      disclosure:
+        type: string
+        default: 'DISCLOSURE: LLM-GENERATED TEXT'
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+permissions:
+  contents: read
+jobs:
+  review:
+    if: >-
+      ${{ github.event_name == 'pull_request' && !github.event.pull_request.draft &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          github.event.pull_request.user.type != 'Bot' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          persist-credentials: false
+          sparse-checkout: tools
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.13'
+      - name: Review
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          OPENAI_REVIEW_MODEL: ${{ inputs.model }}
+          OPENAI_REVIEW_EFFORT: ${{ inputs.effort }}
+          MAX_FINDINGS: ${{ inputs.max-findings }}
+          REVIEW_DISCLOSURE: ${{ inputs.disclosure }}
+          REVIEW_TOOLS_SHA: ${{ job.workflow_sha }}
+        run: python tools/openai_review.py --pr "$PR_NUMBER" --max-findings "$MAX_FINDINGS"
+      - name: Outcome
+        if: always()
+        env:
+          OUTCOME: ${{ job.status }}
+        run: echo "Review execution status $OUTCOME. See step output for coverage and skip reasons." >> "$GITHUB_STEP_SUMMARY"

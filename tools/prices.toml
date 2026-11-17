@@ -1,0 +1,39 @@
+# Prices for agent_metrics.py, in USD per million tokens, standard tier, short context, from
+# https://developers.openai.com/api/docs/pricing on 2026-11-16. Update them from that page. A model
+# with no entry shows its review cost as "n/a". Claude agent runs need no entry: the Agent SDK
+# reports their cost itself.
+
+[models."gpt-6-luna"]
+input_per_million = 0.10
+cached_input_per_million = 0.01
+output_per_million = 0.50
+
+[models."gpt-6.1-terra"]
+input_per_million = 1.0
+cached_input_per_million = 0.05
+output_per_million = 5.0
+
+[models."gpt-6.1-sol"]
+input_per_million = 2.0
+cached_input_per_million = 0.10
+output_per_million = 10.0
+
+[models."gpt-6-astra"]
+input_per_million = 10.0
+cached_input_per_million = 1.0
+output_per_million = 50.0
+
+[models."gpt-5.6-luna"]
+input_per_million = 0.20
+cached_input_per_million = 0.02
+output_per_million = 1.20
+
+[models."gpt-5.6-terra"]
+input_per_million = 2.0
+cached_input_per_million = 0.20
+output_per_million = 12.0
+
+[models."gpt-5.6-sol"]
+input_per_million = 4.0
+cached_input_per_million = 0.40
+output_per_million = 20.0
