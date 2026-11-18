@@ -1,3 +1,5 @@
+import urllib.error
+
 from test_openai_review import review
 from test_agent_metrics import metrics
 import pytest
@@ -75,3 +77,24 @@ def test_unusable_response_posts_incomplete_notice_without_completion_marker(mon
     posted = next(body for method, url, body in calls if method == 'POST' and url.endswith('/reviews'))
     assert review.read_review_record(posted['body'])['coverage'] == 'not-reviewed'
     assert review.MARKER_PREFIX not in posted['body']
+
+
+def test_long_repository_name_gets_a_complete_review(monkeypatch):
+    repository = 'Ambiguous-Interactive/ambiguous-organization-build-lock'
+    calls = setup_review(monkeypatch, DIFF)
+    monkeypatch.setenv('GITHUB_REPOSITORY', repository)
+    original = review.http_json
+
+    def fetch(method, url, headers, body=None, raw=False):
+        if url == review.OPENAI_API and len(body.get('prompt_cache_key', '')) > 64:
+            raise urllib.error.HTTPError(url, 400, 'cache key exceeds 64 characters', None, None)
+        result = original(method, url, headers, body, raw)
+        if method == 'GET' and url.endswith('/pulls/1'):
+            result['head']['repo']['full_name'] = repository
+        return result
+
+    monkeypatch.setattr(review, 'http_json', fetch)
+    assert review.main(['--pr', '1']) == 0
+    posted = next(body for method, url, body in calls if method == 'POST' and url.endswith('/reviews'))
+    assert review.read_review_record(posted['body'])['coverage'] == 'full-eligible-diff'
+    assert review.MARKER_PREFIX in posted['body']

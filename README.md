@@ -13,6 +13,8 @@ but the review step cannot block merging. Keep the review out of required merge 
 Forks, bots, drafts, and closed PRs are ineligible. Caller workflows must use the same guards.
 Use caller-level concurrency keyed by workflow, event, and PR number to serialize reviews.
 A completed head is reviewed once; re-running does not force another review.
+Repository cache keys fit the API's 64-character limit. Longer keys use a stable SHA-256
+digest; existing shorter keys retain their cache partition.
 
 The workflow executes its own source at `job.workflow_sha`, never caller code.
 It fetches allowlisted guides from the captured base commit. Generated/binary assets and
