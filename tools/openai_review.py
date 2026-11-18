@@ -418,7 +418,8 @@ def build_request(model: str, max_findings: int, guide: str, pull: Mapping[str, 
     if effort:
         request["reasoning"] = {"effort": effort}
     if cache_key:
-        request["prompt_cache_key"] = cache_key
+        request["prompt_cache_key"] = (cache_key if len(cache_key) <= 64
+                                       else hashlib.sha256(cache_key.encode("utf-8")).hexdigest())
     return request
 
 

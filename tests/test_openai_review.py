@@ -4,6 +4,8 @@ import importlib.util
 import pathlib
 import sys
 
+import pytest
+
 HERE = pathlib.Path(__file__).resolve().parents[1] / "tools"
 spec = importlib.util.spec_from_file_location("openai_review", HERE / "openai_review.py")
 review = importlib.util.module_from_spec(spec)
@@ -212,3 +214,26 @@ def test_the_record_counts_cached_and_re_review_tokens() -> None:
     usage = {"input_tokens": 100, "output_tokens": 5, "input_tokens_details": {"cached_tokens": 60}}
     record = review.read_review_record(review.review_record("m", "", usage, 1, 1, 10, 0, unchanged=3))
     assert record is not None and record["cached_tokens"] == 60 and record["unchanged_files"] == 3
+
+
+@pytest.mark.parametrize("key", [
+    "x" * 65,
+    "x" * 1000,
+    "缓存" * 40,
+    "openai-review:Ambiguous-Interactive/ambiguous-organization-build-lock",
+])
+def test_long_cache_keys_are_bounded_stable_and_distinct(key: str) -> None:
+    pull = {"number": 1, "title": "t", "body": None}
+    request = review.build_request("m", 5, "g", pull, "d", [], cache_key=key)
+    actual = request["prompt_cache_key"]
+    assert len(actual) <= 64
+    assert actual.isascii()
+    assert actual == review.build_request("m", 5, "g", pull, "d", [], cache_key=key)["prompt_cache_key"]
+    assert actual != review.build_request("m", 5, "g", pull, "d", [], cache_key=key + "different")["prompt_cache_key"]
+
+
+@pytest.mark.parametrize("length", [1, 63, 64])
+def test_accepted_cache_keys_keep_their_existing_partition(length: int) -> None:
+    key = "x" * length
+    request = review.build_request("m", 5, "g", {"number": 1}, "d", [], cache_key=key)
+    assert request["prompt_cache_key"] == key
