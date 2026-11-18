@@ -22,6 +22,8 @@ sensitive paths (including either side of a rename) are excluded. Large diffs ar
 bounded requests, preserving hunk line numbers. Security, configuration and source files get
 priority before tests and documentation when capacity is limited. Findings are combined into
 one COMMENT review per attempt with a global finding limit; reported usage is summed.
+Actions logs distinguish the requested model from each distinct model reported by the API.
+The hidden review record and artifact retain the reported model IDs.
 
 The reviewer retains useful partial results when a file or line cannot fit, a chunk fails,
 guides are unavailable, or the request/time budget is reached. It reserves time to publish

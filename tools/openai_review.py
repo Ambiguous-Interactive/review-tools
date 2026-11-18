@@ -491,7 +491,7 @@ def review_record(model: str, effort: str, usage: Mapping[str, Any], findings: i
         "unchanged_files": unchanged,
     }
     for key in ("chunks_planned", "chunks_attempted", "chunks_reviewed", "failed_chunks", "unreviewed_chunks",
-                "omitted_files", "usage_complete"):
+                "omitted_files", "usage_complete", "reported_models"):
         if key in usage:
             record[key] = usage[key]
     text = json.dumps(record, separators=(",", ":")).replace(">", "\\u003e")
@@ -679,6 +679,12 @@ def main(argv: Sequence[str]) -> int:
     usages: list[Mapping[str, Any]] = []
     successful_chunks: list[str] = []
     attempted_chunks = 0
+    reported_models: set[str] = set()
+
+    def model_for_log(model: str) -> str:
+        return model.replace(openai_key, "[redacted]").replace(github_token, "[redacted]")
+
+    requested_model = model_for_log(arguments.model)
     for index, chunk in enumerate(chunks, 1):
         if time.monotonic() + MODEL_TIMEOUT_SECONDS > started + arguments.max_review_seconds:
             print("::warning::Review time budget reached; retaining completed parts.")
@@ -690,12 +696,20 @@ def main(argv: Sequence[str]) -> int:
                                         "Only assess the supplied diff; do not claim the entire PR is correct.")
         request["store"] = False
         request["max_output_tokens"] = 8000
+        if attempted_chunks == 0:
+            print(f"OpenAI model requested: {json.dumps(requested_model)}", flush=True)
         attempted_chunks += 1
         try:
             response = http_json("POST", OPENAI_API, {"Authorization": f"Bearer {openai_key}"}, request)
         except (urllib.error.URLError, TimeoutError) as error:
             print(f"::warning::Review part {index} unavailable ({type(error).__name__}); continuing other parts.")
             continue
+        model = response.get("model")
+        if isinstance(model, str) and model.strip():
+            safe_model = model_for_log(model)
+            if safe_model not in reported_models:
+                reported_models.add(safe_model)
+                print(f"OpenAI model reported: {json.dumps(safe_model)}", flush=True)
         usages.append(response.get("usage") or {})
         answer = usable_answer(response)
         if answer is None:
@@ -704,6 +718,10 @@ def main(argv: Sequence[str]) -> int:
         results.append(answer)
         successful_chunks.append(chunk)
     usage = sum_usage(usages)
+    if attempted_chunks:
+        usage["reported_models"] = sorted(reported_models)
+        if not reported_models:
+            print("OpenAI model reported: unavailable", flush=True)
     usage["duration_seconds"] = round(time.monotonic() - started, 3)
     failed_chunks = attempted_chunks - len(results)
     unreviewed_chunks = len(chunks) - len(results)
@@ -740,7 +758,7 @@ def main(argv: Sequence[str]) -> int:
               f"Reviewed {len(results)} bounded diff parts. Cross-part interactions may need human review.",
               "findings": list(unique.values())}
     reviewed_diff = "".join(successful_chunks)
-    review = build_review(result, commentable_lines(reviewed_diff), head_sha, arguments.model,
+    review = build_review(result, commentable_lines(reviewed_diff), head_sha, requested_model,
                           arguments.max_findings, usage, arguments.effort, len(reviewed_diff),
                           len(dropped), 0)
     if arguments.output is not None:
@@ -762,7 +780,7 @@ def main(argv: Sequence[str]) -> int:
             raise
         print(f"Inline review refused ({error.code}); posting the findings in the review body.", file=sys.stderr)
         finding_count = min(arguments.max_findings, len(result.get("findings") or []))
-        review = body_only(review, arguments.model, arguments.effort, usage, finding_count,
+        review = body_only(review, requested_model, arguments.effort, usage, finding_count,
                            len(reviewed_diff), len(dropped), 0)
         http_json("POST", f"{base}/reviews", github_headers(github_token), review)
     print(f"Posted a review with {len(review['comments'])} inline comments on {head_sha[:10]}.")

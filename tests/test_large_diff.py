@@ -214,3 +214,52 @@ def test_publication_failure_preserves_completed_review(monkeypatch, tmp_path):
         review.main(['--pr', '1', '--output', str(output)])
     payload = json.loads(output.read_text())
     assert payload['commit_id'] == 'a'*40 and payload['event'] == 'COMMENT'
+
+
+def test_review_logs_requested_and_reported_models(monkeypatch, capsys):
+    calls = setup_review(monkeypatch, patch('a.py') + patch('b.py') + patch('c.py'))
+    original = review.http_json
+    reported = iter(('review-model-2026-11-01', 'review-model-2026-11-01', 'fallback-model'))
+
+    def fetch(method, url, headers, body=None, raw=False):
+        response = original(method, url, headers, body, raw)
+        if url == review.OPENAI_API:
+            response['model'] = next(reported)
+        return response
+
+    monkeypatch.setattr(review, 'http_json', fetch)
+    assert review.main(['--pr', '1', '--model', 'review-alias', '--max-diff-chars', '260']) == 0
+    output = capsys.readouterr().out
+    assert 'OpenAI model requested: "review-alias"' in output
+    assert output.count('OpenAI model reported: "review-model-2026-11-01"') == 1
+    assert 'OpenAI model reported: "fallback-model"' in output
+    body = posted(calls)[0]['body']
+    record = review.read_review_record(body)
+    assert record['model'] == 'review-alias'
+    assert record['reported_models'] == ['fallback-model', 'review-model-2026-11-01']
+    assert 'fallback-model' not in body.split(review.RECORD_PREFIX)[0]
+
+
+def test_review_does_not_infer_a_served_model_from_the_request(monkeypatch, capsys):
+    calls = setup_review(monkeypatch, patch('a.py'), {'status': 'incomplete'})
+    assert review.main(['--pr', '1', '--model', 'review-alias']) == 0
+    output = capsys.readouterr().out
+    assert 'OpenAI model requested: "review-alias"' in output
+    assert 'OpenAI model reported: unavailable' in output
+    record = review.read_review_record(posted(calls)[0]['body'])
+    assert record['reported_models'] == []
+    assert record['coverage'] == 'not-reviewed'
+
+
+def test_model_logging_redacts_before_escaping(monkeypatch, capsys):
+    key = 'test-"key"'
+    calls = setup_review(monkeypatch, patch('a.py'), {'status': 'incomplete', 'model': key + '\n::warning::text'})
+    monkeypatch.setenv('OPENAI_API_KEY', key)
+    assert review.main(['--pr', '1', '--model', key]) == 0
+    output = capsys.readouterr().out
+    assert 'OpenAI model requested: "[redacted]"' in output
+    assert 'OpenAI model reported: "[redacted]\\n::warning::text"' in output
+    assert not any(line.startswith('::warning::text') for line in output.splitlines())
+    record = review.read_review_record(posted(calls)[0]['body'])
+    assert record['model'] == '[redacted]'
+    assert record['reported_models'] == ['[redacted]\n::warning::text']
